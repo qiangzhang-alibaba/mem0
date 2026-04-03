@@ -145,3 +145,167 @@ Since `categories` is stored as a JSON array string in metadata, the following f
 ### Adding Memories Without Custom Categories
 
 If `custom_categories` is not provided, the memory creation behaves as usual — no classification is performed and no `categories` field is added to metadata. This ensures full backward compatibility.
+
+
+## Category Templates
+
+Mem0 supports **Category Templates** that allow you to pre-define reusable category schemas for memory classification. Instead of passing `custom_categories` inline every time, you can create a template once and reference it by name when adding memories.
+
+### Storage Backend Configuration
+
+Configure the category template storage backend via the `CATEGORY_TEMPLATE_STORE` environment variable:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CATEGORY_TEMPLATE_STORE` | `json` | Storage backend: `json` (local JSON files) or `database` (PostgreSQL) |
+| `CATEGORY_TEMPLATE_JSON_DIR` | `data/category_templates` | Directory for JSON file storage (only used when backend is `json`) |
+
+- **`json`** (default): Stores templates as local JSON files in the directory specified by `CATEGORY_TEMPLATE_JSON_DIR`. Each user gets a separate file (`{user_id}.json`).
+- **`database`**: Uses PostgreSQL, reusing the same connection parameters as the vector store (`POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`). Automatically creates the `category_templates` table on first use.
+
+### Category Template CRUD APIs
+
+> **Note**: All endpoints use `X-API-Key` header authentication (same as `/memories` endpoints). Replace `YOUR_API_KEY` with your actual API key, and `localhost:8888` with your server address.
+
+#### 1. Create a Category Template
+
+```bash
+curl -X POST http://localhost:8888/v1/category-templates \
+  -H "X-API-Key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "test-user-001",
+    "template_name": "food_template",
+    "categories": {
+      "food_preferences": "User food preferences and dietary habits",
+      "restaurants": "Favorite restaurants and dining experiences",
+      "cooking": "Cooking skills, recipes, and kitchen preferences"
+    }
+  }'
+```
+
+Response (HTTP 201):
+
+```json
+{
+  "id": 1,
+  "user_id": "test-user-001",
+  "template_name": "food_template",
+  "categories": {
+    "food_preferences": "User food preferences and dietary habits",
+    "restaurants": "Favorite restaurants and dining experiences",
+    "cooking": "Cooking skills, recipes, and kitchen preferences"
+  },
+  "created_at": "2025-01-15T10:30:00+00:00",
+  "updated_at": "2025-01-15T10:30:00+00:00"
+}
+```
+
+#### 2. List All Templates for a User
+
+```bash
+curl "http://localhost:8888/v1/category-templates?user_id=test-user-001" \
+  -H "X-API-Key: YOUR_API_KEY"
+```
+
+Response:
+
+```json
+{
+  "results": [
+    {
+      "id": 1,
+      "user_id": "test-user-001",
+      "template_name": "food_template",
+      "categories": { ... },
+      "created_at": "2025-01-15T10:30:00+00:00",
+      "updated_at": "2025-01-15T10:30:00+00:00"
+    }
+  ]
+}
+```
+
+#### 3. Get a Single Template
+
+```bash
+curl "http://localhost:8888/v1/category-templates/food_template?user_id=test-user-001" \
+  -H "X-API-Key: YOUR_API_KEY"
+```
+
+#### 4. Update a Template
+
+```bash
+curl -X PUT "http://localhost:8888/v1/category-templates/food_template?user_id=test-user-001" \
+  -H "X-API-Key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "categories": {
+      "food_preferences": "Updated: User food preferences and dietary habits",
+      "restaurants": "Favorite restaurants and dining experiences",
+      "cooking": "Cooking skills and recipes",
+      "beverages": "Drink preferences including coffee, tea, and alcohol"
+    }
+  }'
+```
+
+#### 5. Delete a Template
+
+```bash
+curl -X DELETE "http://localhost:8888/v1/category-templates/food_template?user_id=test-user-001" \
+  -H "X-API-Key: YOUR_API_KEY"
+```
+
+### Using Templates When Adding Memories
+
+When creating a memory via `POST /memories`, you can pass `category_template_name` instead of `custom_categories`. The server will look up the template by name and use its categories for LLM-based classification.
+
+> **Priority rule**: If both `category_template_name` and `custom_categories` are provided, `category_template_name` takes priority and `custom_categories` is ignored.
+
+#### Step 1: Create a template (one-time setup)
+
+```bash
+curl -X POST http://localhost:8888/v1/category-templates \
+  -H "X-API-Key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "test-user-001",
+    "template_name": "food_template",
+    "categories": {
+      "food_preferences": "User food preferences and dietary habits",
+      "restaurants": "Favorite restaurants and dining experiences"
+    }
+  }'
+```
+
+#### Step 2: Add memories using the template name
+
+```bash
+curl -X POST http://localhost:8888/memories \
+  -H "X-API-Key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "I love sushi and ramen. My favorite restaurant is Ichiran."}
+    ],
+    "user_id": "test-user-001",
+    "category_template_name": "food_template",
+    "infer": true
+  }'
+```
+
+The server will automatically resolve `food_template` to its categories and classify the extracted memories accordingly. The result is identical to passing `custom_categories` inline — memories will have `metadata.categories` populated with the LLM-assigned categories.
+
+#### Step 3: Search/filter memories by categories
+
+```bash
+curl -X POST http://localhost:8888/search \
+  -H "X-API-Key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "food",
+    "user_id": "test-user-001",
+    "filters": {
+      "categories": ["food_preferences"]
+    }
+  }'
+```

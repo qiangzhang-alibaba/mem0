@@ -10,8 +10,13 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 from mem0 import Memory
+from mem0.memory.category_template_store import (
+    DatabaseCategoryTemplateStore,
+    JsonFileCategoryTemplateStore,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -76,6 +81,39 @@ DEFAULT_CONFIG = {
 
 MEMORY_INSTANCE = Memory.from_config(DEFAULT_CONFIG)
 
+# ---------------------------------------------------------------------------
+# Category Template Store initialization
+# ---------------------------------------------------------------------------
+CATEGORY_TEMPLATE_STORE_TYPE = os.environ.get("CATEGORY_TEMPLATE_STORE", "json")
+CATEGORY_TEMPLATE_JSON_DIR = os.environ.get("CATEGORY_TEMPLATE_JSON_DIR", "data/category_templates")
+
+CATEGORY_TEMPLATE_STORE_INSTANCE = None
+try:
+    if CATEGORY_TEMPLATE_STORE_TYPE == "json":
+        CATEGORY_TEMPLATE_STORE_INSTANCE = JsonFileCategoryTemplateStore(
+            base_dir=CATEGORY_TEMPLATE_JSON_DIR,
+        )
+    elif CATEGORY_TEMPLATE_STORE_TYPE == "database":
+        CATEGORY_TEMPLATE_STORE_INSTANCE = DatabaseCategoryTemplateStore(
+            host=POSTGRES_HOST,
+            port=int(POSTGRES_PORT),
+            dbname=POSTGRES_DB,
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+        )
+    else:
+        logging.warning(
+            "Unknown CATEGORY_TEMPLATE_STORE value: %s, falling back to json",
+            CATEGORY_TEMPLATE_STORE_TYPE,
+        )
+        CATEGORY_TEMPLATE_STORE_INSTANCE = JsonFileCategoryTemplateStore(
+            base_dir=CATEGORY_TEMPLATE_JSON_DIR,
+        )
+    logging.info("Category template store initialized: %s", CATEGORY_TEMPLATE_STORE_TYPE)
+except Exception as e:
+    logging.warning("Failed to initialize category template store: %s", e)
+    CATEGORY_TEMPLATE_STORE_INSTANCE = None
+
 app = FastAPI(
     title="Mem0 REST APIs",
     description=(
@@ -123,7 +161,15 @@ class MemoryCreate(BaseModel):
     memory_type: Optional[str] = Field(None, description="Type of memory to store (e.g. 'core').")
     prompt: Optional[str] = Field(None, description="Custom prompt to use for fact extraction.")
     custom_categories: Optional[Dict[str, str]] = Field(None, description="Custom categories dict for memory classification. Each key is a category name, value is a description.")
+    category_template_name: Optional[str] = Field(None, description="Name of a pre-defined category template to use for classification. Takes priority over custom_categories.")
 
+class CategoryTemplateCreate(BaseModel):
+    user_id: str = Field(..., description="User ID who owns this template.")
+    template_name: str = Field(..., description="Unique template name within the user scope.")
+    categories: Dict[str, str] = Field(..., description="Dict mapping category name to description.")
+
+class CategoryTemplateUpdate(BaseModel):
+    categories: Dict[str, str] = Field(..., description="Updated categories dict.")
 
 class SearchRequest(BaseModel):
     query: str = Field(..., description="Search query.")
@@ -145,11 +191,38 @@ def set_config(config: Dict[str, Any], _api_key: Optional[str] = Depends(verify_
 
 @app.post("/memories", summary="Create memories")
 def add_memory(memory_create: MemoryCreate, _api_key: Optional[str] = Depends(verify_api_key)):
-    """Store new memories."""
+    """Store new memories.
+
+    Supports automatic memory classification via:
+    - ``custom_categories``: inline dict of category name -> description
+    - ``category_template_name``: name of a pre-defined template (takes priority over custom_categories)
+    """
     if not any([memory_create.user_id, memory_create.agent_id, memory_create.run_id]):
         raise HTTPException(status_code=400, detail="At least one identifier (user_id, agent_id, run_id) is required.")
 
-    params = {k: v for k, v in memory_create.model_dump().items() if v is not None and k != "messages"}
+    # Resolve custom_categories: category_template_name takes priority
+    resolved_custom_categories = memory_create.custom_categories
+    if memory_create.category_template_name:
+        if CATEGORY_TEMPLATE_STORE_INSTANCE is None:
+            raise HTTPException(status_code=503, detail="Category template store not initialized")
+        user_id = memory_create.user_id
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required when using category_template_name")
+        template = CATEGORY_TEMPLATE_STORE_INSTANCE.get(
+            user_id=user_id, template_name=memory_create.category_template_name
+        )
+        if template is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Category template '{memory_create.category_template_name}' not found for user '{user_id}'"
+            )
+        resolved_custom_categories = template["categories"]
+
+    params = {k: v for k, v in memory_create.model_dump().items()
+              if v is not None and k not in ("messages", "custom_categories", "category_template_name")}
+    if resolved_custom_categories:
+        params["custom_categories"] = resolved_custom_categories
+
     try:
         response = MEMORY_INSTANCE.add(messages=[m.model_dump() for m in memory_create.messages], **params)
         return JSONResponse(content=response)
@@ -312,3 +385,124 @@ def reset_memory(_api_key: Optional[str] = Depends(verify_api_key)):
 def home():
     """Redirect to the OpenAPI documentation."""
     return RedirectResponse(url="/docs")
+
+# ---------------------------------------------------------------------------
+# Category Template CRUD API
+# ---------------------------------------------------------------------------
+
+@app.post("/v1/category-templates", summary="Create a category template")
+@app.post("/v1/category-templates/", include_in_schema=False)
+def create_category_template(
+    body: CategoryTemplateCreate,
+    _api_key: Optional[str] = Depends(verify_api_key),
+):
+    """Create a new category template for a user.
+
+    Example::
+
+        curl -X POST http://localhost:8888/v1/category-templates \\
+          -H "Authorization: Token <apikey>" \\
+          -H "Content-Type: application/json" \\
+          -d '{"user_id": "alice", "template_name": "custom_categories_food",
+               "categories": {"food_preferences": "User food preferences",
+                              "restaurants": "Favorite restaurants"}}"'
+    """
+    if CATEGORY_TEMPLATE_STORE_INSTANCE is None:
+        raise HTTPException(status_code=503, detail="Category template store not initialized")
+    try:
+        result = CATEGORY_TEMPLATE_STORE_INSTANCE.create(
+            user_id=body.user_id,
+            template_name=body.template_name,
+            categories=body.categories,
+        )
+        return JSONResponse(content=result, status_code=201)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        logger.error("[category-templates] create failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/category-templates", summary="List category templates for a user")
+@app.get("/v1/category-templates/", include_in_schema=False)
+def list_category_templates(
+    user_id: str = Query(..., description="User ID"),
+    _api_key: Optional[str] = Depends(verify_api_key),
+):
+    """List all category templates for a given user."""
+    if CATEGORY_TEMPLATE_STORE_INSTANCE is None:
+        raise HTTPException(status_code=503, detail="Category template store not initialized")
+    try:
+        results = CATEGORY_TEMPLATE_STORE_INSTANCE.list(user_id=user_id)
+        return JSONResponse(content={"results": results})
+    except Exception as e:
+        logger.error("[category-templates] list failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/category-templates/{template_name}", summary="Get a category template")
+def get_category_template(
+    template_name: str,
+    user_id: str = Query(..., description="User ID"),
+    _api_key: Optional[str] = Depends(verify_api_key),
+):
+    """Get a single category template by name."""
+    if CATEGORY_TEMPLATE_STORE_INSTANCE is None:
+        raise HTTPException(status_code=503, detail="Category template store not initialized")
+    try:
+        result = CATEGORY_TEMPLATE_STORE_INSTANCE.get(user_id=user_id, template_name=template_name)
+        if result is None:
+            raise HTTPException(status_code=404, detail=f"Category template '{template_name}' not found for user '{user_id}'")
+        return JSONResponse(content=result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("[category-templates] get failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/v1/category-templates/{template_name}", summary="Update a category template")
+def update_category_template(
+    template_name: str,
+    body: CategoryTemplateUpdate,
+    user_id: str = Query(..., description="User ID"),
+    _api_key: Optional[str] = Depends(verify_api_key),
+):
+    """Update the categories of an existing template."""
+    if CATEGORY_TEMPLATE_STORE_INSTANCE is None:
+        raise HTTPException(status_code=503, detail="Category template store not initialized")
+    try:
+        result = CATEGORY_TEMPLATE_STORE_INSTANCE.update(
+            user_id=user_id,
+            template_name=template_name,
+            categories=body.categories,
+        )
+        if result is None:
+            raise HTTPException(status_code=404, detail=f"Category template '{template_name}' not found for user '{user_id}'")
+        return JSONResponse(content=result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("[category-templates] update failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/v1/category-templates/{template_name}", summary="Delete a category template")
+def delete_category_template(
+    template_name: str,
+    user_id: str = Query(..., description="User ID"),
+    _api_key: Optional[str] = Depends(verify_api_key),
+):
+    """Delete a category template."""
+    if CATEGORY_TEMPLATE_STORE_INSTANCE is None:
+        raise HTTPException(status_code=503, detail="Category template store not initialized")
+    try:
+        deleted = CATEGORY_TEMPLATE_STORE_INSTANCE.delete(user_id=user_id, template_name=template_name)
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"Category template '{template_name}' not found for user '{user_id}'")
+        return JSONResponse(content={"message": f"Template '{template_name}' deleted successfully"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("[category-templates] delete failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
